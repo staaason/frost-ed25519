@@ -46,13 +46,9 @@ func (h *Header) UnmarshalBinary(data []byte) error {
 	}
 
 	switch msgType {
-	case MessageTypeKeyGen1, MessageTypeSign1, MessageTypeSign2:
+	case MessageTypeSign1, MessageTypeSign2:
 		if to != 0 {
 			return errors.New("Header.UnmarshalBinary: .To field must be 0 to indicate broadcast")
-		}
-	case MessageTypeKeyGen2:
-		if to == 0 {
-			return errors.New("Header.UnmarshalBinary: MessageTypeKeyGen2 requires a sender (.To field)")
 		}
 	default:
 		return errors.New("Header.UnmarshalBinary: invalid message type")
@@ -69,13 +65,9 @@ func (h *Header) UnmarshalBinary(data []byte) error {
 
 func (h *Header) BytesAppend(existing []byte) (data []byte, err error) {
 	switch h.Type {
-	case MessageTypeKeyGen1, MessageTypeSign1, MessageTypeSign2:
+	case MessageTypeSign1, MessageTypeSign2:
 		if h.To != 0 {
 			return nil, errors.New("Header.BytesAppend: .To field must be 0 to indicate broadcast")
-		}
-	case MessageTypeKeyGen2:
-		if h.To == 0 {
-			return nil, errors.New("Header.BytesAppend: MessageTypeKeyGen2 requires a sender (.To field)")
 		}
 	default:
 		return nil, errors.New("Header.BytesAppend: invalid message type")

@@ -22,46 +22,6 @@ func TestHeader_UnmarshalBinary(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			"ok keygen1",
-			fields{
-				Type: MessageTypeKeyGen1,
-				From: 1,
-				To:   0,
-			},
-			args{data: []byte{1, 0, 1, 0, 0}},
-			false,
-		},
-		{
-			"bad keygen1",
-			fields{
-				Type: MessageTypeKeyGen1,
-				From: 1,
-				To:   2,
-			},
-			args{data: []byte{1, 0, 1, 0, 2}},
-			true,
-		},
-		{
-			"ok keygen2",
-			fields{
-				Type: MessageTypeKeyGen2,
-				From: 2,
-				To:   1,
-			},
-			args{data: []byte{2, 0, 2, 0, 1}},
-			false,
-		},
-		{
-			"bad keygen2",
-			fields{
-				Type: MessageTypeKeyGen2,
-				From: 2,
-				To:   0,
-			},
-			args{data: []byte{2, 0, 2, 0, 0}},
-			true,
-		},
-		{
 			"ok sign1",
 			fields{
 				Type: MessageTypeSign1,

@@ -9,11 +9,9 @@ import (
 	"strconv"
 
 	"github.com/taurusgroup/frost-ed25519/pkg/eddsa"
-	"github.com/taurusgroup/frost-ed25519/pkg/frost"
-	"github.com/taurusgroup/frost-ed25519/pkg/frost/keygen"
+	"github.com/taurusgroup/frost-ed25519/pkg/frost/chilldkg"
 	"github.com/taurusgroup/frost-ed25519/pkg/frost/party"
-	"github.com/taurusgroup/frost-ed25519/pkg/helpers"
-	"github.com/taurusgroup/frost-ed25519/pkg/state"
+	"github.com/taurusgroup/frost-ed25519/pkg/ristretto"
 )
 
 const maxN = 100
@@ -50,74 +48,47 @@ func main() {
 		return
 	}
 
-	partyIDs := helpers.GenerateSet(party.ID(n))
-
-	// structure holding parties' state and output
-	states := map[party.ID]*state.State{}
-	outputs := map[party.ID]*keygen.Output{}
-
-	// create a state for each party
-	for _, id := range partyIDs {
-		states[id], outputs[id], err = frost.NewKeygenState(id, partyIDs, party.Size(t), 0)
+	hostseckeys := make([]*ristretto.Scalar, n)
+	hostpubkeys := make([]ristretto.Element, n)
+	for i := 0; i < n; i++ {
+		sk, pk, err := chilldkg.GenerateHostKey()
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
+		hostseckeys[i] = sk
+		hostpubkeys[i] = *pk
 	}
 
-	msgsOut1 := make([][]byte, 0, n)
-	msgsOut2 := make([][]byte, 0, n*(n-1)/2)
-
-	for _, s := range states {
-		msgs1, err := helpers.PartyRoutine(nil, s)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		msgsOut1 = append(msgsOut1, msgs1...)
+	params := &chilldkg.SessionParams{
+		HostPubkeys: hostpubkeys,
+		Threshold:   party.Size(t),
 	}
 
-	for _, s := range states {
-		msgs2, err := helpers.PartyRoutine(msgsOut1, s)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		msgsOut2 = append(msgsOut2, msgs2...)
-	}
-
-	for _, s := range states {
-		_, err := helpers.PartyRoutine(msgsOut2, s)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-	}
-
-	// Get the public data
-	fmt.Println("Group Key:")
-	id0 := partyIDs[0]
-	if err = states[id0].WaitForError(); err != nil {
+	outputs, _, err := chilldkg.SimulateSession(hostseckeys, params)
+	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	public := outputs[id0].Public
-	secrets := make(map[party.ID]*eddsa.SecretShare, n)
+
+	public, secretShares, err := chilldkg.OutputToFROST(outputs, params)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	fmt.Println("Group Key:")
 	groupKey := public.GroupKey
 	fmt.Printf("  %x\n\n", groupKey.ToEd25519())
 
-	for _, id := range partyIDs {
-		if err := states[id].WaitForError(); err != nil {
-			fmt.Println(err)
-			return
-		}
-		shareSecret := outputs[id].SecretKey
+	secrets := make(map[party.ID]*eddsa.SecretShare, n)
+	for i, ss := range secretShares {
+		id := party.ID(i + 1)
+		secrets[id] = ss
 		sharePublic := public.Shares[id]
-		secrets[id] = shareSecret
-		fmt.Printf("Party %d:\n  secret: %x\n  public: %x\n", id, shareSecret.Secret.Bytes(), sharePublic.Bytes())
+		fmt.Printf("Party %d:\n  secret: %x\n  public: %x\n", id, ss.Secret.Bytes(), sharePublic.Bytes())
 	}
 
-	// TODO: write JSON file, to take as input by CLI signer
 	type KeyGenOutput struct {
 		Secrets map[party.ID]*eddsa.SecretShare
 		Shares  *eddsa.Public

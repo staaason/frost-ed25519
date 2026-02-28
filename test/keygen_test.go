@@ -5,78 +5,50 @@ import (
 	"testing"
 
 	"github.com/taurusgroup/frost-ed25519/pkg/eddsa"
-	"github.com/taurusgroup/frost-ed25519/pkg/frost"
-	"github.com/taurusgroup/frost-ed25519/pkg/frost/keygen"
+	"github.com/taurusgroup/frost-ed25519/pkg/frost/chilldkg"
 	"github.com/taurusgroup/frost-ed25519/pkg/frost/party"
-	"github.com/taurusgroup/frost-ed25519/pkg/helpers"
 	"github.com/taurusgroup/frost-ed25519/pkg/ristretto"
-	"github.com/taurusgroup/frost-ed25519/pkg/state"
 )
 
 func TestKeygen(t *testing.T) {
 	N := party.Size(50)
 	T := N / 2
 
-	partyIDs := helpers.GenerateSet(N)
-
-	states := map[party.ID]*state.State{}
-	outputs := map[party.ID]*keygen.Output{}
-
-	for _, id := range partyIDs {
-		var err error
-		states[id], outputs[id], err = frost.NewKeygenState(id, partyIDs, T, 0)
+	n := int(N)
+	seckeys := make([]*ristretto.Scalar, n)
+	pubkeys := make([]ristretto.Element, n)
+	for i := 0; i < n; i++ {
+		sk, pk, err := chilldkg.GenerateHostKey()
 		if err != nil {
-			t.Error(err)
-			return
+			t.Fatal(err)
 		}
+		seckeys[i] = sk
+		pubkeys[i] = *pk
 	}
 
-	msgsOut1 := make([][]byte, 0, N)
-	msgsOut2 := make([][]byte, 0, N*(N-1)/2)
-
-	for _, s := range states {
-		msgs1, err := helpers.PartyRoutine(nil, s)
-		if err != nil {
-			t.Error(err)
-		}
-		msgsOut1 = append(msgsOut1, msgs1...)
+	params := &chilldkg.SessionParams{
+		HostPubkeys: pubkeys,
+		Threshold:   T,
 	}
 
-	for _, s := range states {
-		msgs2, err := helpers.PartyRoutine(msgsOut1, s)
-		if err != nil {
-			t.Error(err)
-		}
-		msgsOut2 = append(msgsOut2, msgs2...)
+	outputs, _, err := chilldkg.SimulateSession(seckeys, params)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for _, s := range states {
-		_, err := helpers.PartyRoutine(msgsOut2, s)
-		if err != nil {
-			t.Error(err)
-		}
+	public, secretSharesList, err := chilldkg.OutputToFROST(outputs, params)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	id1 := partyIDs[0]
-	if err := states[id1].WaitForError(); err != nil {
-		t.Error(err)
-	}
-	groupKey1 := outputs[id1].Public.GroupKey
-	publicShares1 := outputs[id1].Public
+	groupKey1 := public.GroupKey
 	secrets := map[party.ID]*eddsa.SecretShare{}
-	for _, id2 := range partyIDs {
-		if err := states[id2].WaitForError(); err != nil {
-			t.Error(err)
-		}
-		groupKey2 := outputs[id2].Public.GroupKey
-		publicShares2 := outputs[id2].Public
-		secrets[id2] = outputs[id2].SecretKey
-		if err := CompareOutput(groupKey1, groupKey2, publicShares1, publicShares2); err != nil {
-			t.Error(err)
-		}
+	for i, ss := range secretSharesList {
+		id := party.ID(i + 1)
+		secrets[id] = ss
 	}
 
-	if err := ValidateSecrets(secrets, groupKey1, publicShares1); err != nil {
+	if err := ValidateSecrets(secrets, groupKey1, public); err != nil {
 		t.Error(err)
 	}
 }

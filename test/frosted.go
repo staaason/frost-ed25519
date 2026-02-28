@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/taurusgroup/frost-ed25519/pkg/eddsa"
+	"github.com/taurusgroup/frost-ed25519/pkg/frost/chilldkg"
 	"github.com/taurusgroup/frost-ed25519/pkg/frost/party"
+	"github.com/taurusgroup/frost-ed25519/pkg/ristretto"
 	"github.com/taurusgroup/frost-ed25519/test/internal/communication"
 )
 
@@ -21,25 +23,45 @@ func Setup(N, T party.Size) (message []byte, keygenIDs, signIDs []party.ID) {
 	return
 }
 
-func DoKeygen(N, T party.Size, keygenIDs []party.ID, keygenComm map[party.ID]communication.Communicator) (*eddsa.Public, map[party.ID]*eddsa.SecretShare, error) {
-	var err error
-	keygenHandlers := make(map[party.ID]*communication.KeyGenHandler, N)
-	for _, id := range keygenIDs {
-		keygenHandlers[id], err = communication.NewKeyGenHandler(keygenComm[id], id, keygenIDs, T)
+func DoKeygen(N, T party.Size, keygenIDs []party.ID) (*eddsa.Public, map[party.ID]*eddsa.SecretShare, error) {
+	n := int(N)
+	seckeys := make([]*ristretto.Scalar, n)
+	pubkeys := make([]ristretto.Element, n)
+	for i := 0; i < n; i++ {
+		sk, pk, err := chilldkg.GenerateHostKey()
 		if err != nil {
 			return nil, nil, err
 		}
+		seckeys[i] = sk
+		pubkeys[i] = *pk
 	}
 
-	var public *eddsa.Public
-	secrets := map[party.ID]*eddsa.SecretShare{}
-	for id, h := range keygenHandlers {
-		if err = h.State.WaitForError(); err != nil {
-			return nil, nil, err
-		}
-		public = h.Out.Public
-		secrets[id] = h.Out.SecretKey
+	params := &chilldkg.SessionParams{
+		HostPubkeys: pubkeys,
+		Threshold:   T,
 	}
+
+	outputs, _, err := chilldkg.SimulateSession(seckeys, params)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	secrets := map[party.ID]*eddsa.SecretShare{}
+	for i := 0; i < n; i++ {
+		secrets[keygenIDs[i]] = eddsa.NewSecretShare(keygenIDs[i], outputs[i].SecShare)
+	}
+
+	partyShares := make(map[party.ID]*ristretto.Element, n)
+	for i := 0; i < n; i++ {
+		var pub ristretto.Element
+		pub.ScalarBaseMult(outputs[i].SecShare)
+		partyShares[keygenIDs[i]] = &pub
+	}
+	public, err := eddsa.NewPublic(partyShares, T)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	return public, secrets, nil
 }
 
@@ -77,9 +99,7 @@ func FROSTestUDP(N, T party.Size) error {
 	fmt.Printf("Using UDP:\n(n, t) = (%v, %v): ", N, T)
 
 	message, keygenIDs, signIDs := Setup(N, T)
-	keygenComm := communication.NewUDPCommunicatorMap(keygenIDs)
-	defer destroyCommMap(keygenComm)
-	shares, secrets, err := DoKeygen(N, T, keygenIDs, keygenComm)
+	shares, secrets, err := DoKeygen(N, T, keygenIDs)
 	if err != nil {
 		return err
 	}
@@ -94,9 +114,7 @@ func FROSTestChannel(N, T party.Size) error {
 	fmt.Printf("Using Channels:\n(n, t) = (%v, %v): ", N, T)
 
 	message, keygenIDs, signIDs := Setup(N, T)
-	keygenComm := communication.NewChannelCommunicatorMap(keygenIDs)
-	defer destroyCommMap(keygenComm)
-	shares, secrets, err := DoKeygen(N, T, keygenIDs, keygenComm)
+	shares, secrets, err := DoKeygen(N, T, keygenIDs)
 	if err != nil {
 		return err
 	}
@@ -116,7 +134,6 @@ func destroyCommMap(m map[party.ID]communication.Communicator) {
 func main() {
 	ns := []party.Size{5, 10, 50}
 
-	// what should work
 	for _, n := range ns {
 		start := time.Now()
 		err := FROSTestUDP(n, n/2)
@@ -159,7 +176,6 @@ func main() {
 		fmt.Printf("%s\n", elapsed)
 	}
 
-	// what should NOT work, but should not panic
 	for _, n := range ns {
 		if FROSTestUDP(n, n) == nil {
 			fmt.Println("ERROR: failed to fail")

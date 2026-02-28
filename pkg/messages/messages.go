@@ -7,10 +7,8 @@ import (
 
 type Message struct {
 	Header
-	KeyGen1 *KeyGen1
-	KeyGen2 *KeyGen2
-	Sign1   *Sign1
-	Sign2   *Sign2
+	Sign1 *Sign1
+	Sign2 *Sign2
 }
 
 var ErrInvalidMessage = errors.New("invalid message")
@@ -20,8 +18,6 @@ type MessageType uint8
 // MessageType s must be increasing.
 const (
 	MessageTypeNone MessageType = iota
-	MessageTypeKeyGen1
-	MessageTypeKeyGen2
 	MessageTypeSign1
 	MessageTypeSign2
 )
@@ -33,14 +29,6 @@ func (m *Message) BytesAppend(existing []byte) (data []byte, err error) {
 	}
 
 	switch m.Type {
-	case MessageTypeKeyGen1:
-		if m.KeyGen1 != nil {
-			return m.KeyGen1.BytesAppend(existing)
-		}
-	case MessageTypeKeyGen2:
-		if m.KeyGen2 != nil {
-			return m.KeyGen2.BytesAppend(existing)
-		}
 	case MessageTypeSign1:
 		if m.Sign1 != nil {
 			return m.Sign1.BytesAppend(existing)
@@ -57,14 +45,6 @@ func (m *Message) BytesAppend(existing []byte) (data []byte, err error) {
 func (m *Message) Size() int {
 	var size int
 	switch m.Type {
-	case MessageTypeKeyGen1:
-		if m.KeyGen1 != nil {
-			size = m.KeyGen1.Size()
-		}
-	case MessageTypeKeyGen2:
-		if m.KeyGen2 != nil {
-			size = m.KeyGen2.Size()
-		}
 	case MessageTypeSign1:
 		if m.Sign1 != nil {
 			size = m.Sign1.Size()
@@ -93,18 +73,6 @@ func (m *Message) UnmarshalBinary(data []byte) error {
 	data = data[m.Header.Size():]
 
 	switch m.Type {
-	case MessageTypeKeyGen1:
-		var keygen1 KeyGen1
-		if err = keygen1.UnmarshalBinary(data); err == nil {
-			m.KeyGen1 = &keygen1
-		}
-
-	case MessageTypeKeyGen2:
-		var keygen2 KeyGen2
-		if err = keygen2.UnmarshalBinary(data); err == nil {
-			m.KeyGen2 = &keygen2
-		}
-
 	case MessageTypeSign1:
 		var sign1 Sign1
 		if err = sign1.UnmarshalBinary(data); err == nil {
@@ -133,14 +101,6 @@ func (m *Message) Equal(other interface{}) bool {
 	}
 
 	switch m.Type {
-	case MessageTypeKeyGen1:
-		if m.KeyGen1 != nil && otherMsg.KeyGen1 != nil {
-			return m.KeyGen1.Equal(otherMsg.KeyGen1)
-		}
-	case MessageTypeKeyGen2:
-		if m.KeyGen2 != nil && otherMsg.KeyGen2 != nil {
-			return m.KeyGen2.Equal(otherMsg.KeyGen2)
-		}
 	case MessageTypeSign1:
 		if m.Sign1 != nil && otherMsg.Sign1 != nil {
 			return m.Sign1.Equal(otherMsg.Sign1)

@@ -46,7 +46,7 @@ These shares are represented as integers mod `q`.
 Given any set of at least `t+1` distinct shares, it is possible to recover the original full secret key `s mod q`. 
 The integer `t` is the _threshold_ of the scheme, and defines the maximum number of parties that could act maliciously (i.e. collaborate to recover the key).
 
-In FROST-Ed25519, the parties obtain their shares of `s` by executing a Distributed Key Generation (DKG) protocol.
+In FROST-Ed25519, the parties obtain their shares of `s` by executing the ChillDKG protocol (a Distributed Key Generation protocol adapted from the [BIP-FROST-DKG](https://github.com/BlockstreamResearch/bip-frost-dkg) specification).
 In addition to receiving individual shares `s_i`, all parties also obtain the _group key_ `A = [s]•G`, and its associated public shares `{A_i = [s_i]•G}`.
 
 After a successful execution of the DKG protocol, each party `Pi` obtains:
@@ -116,7 +116,205 @@ ed25519.Verify(groupKey.ToEd25519(), message, groupSig.ToEd25519()) // = true
 secretShare.ID == id    // = true
 ```
 
-## Protocol version implemented
+## FROST Protocol — Mathematical Description
+
+This section describes the mathematical foundations of FROST as implemented in this project. The implementation follows the FROST1/FROST2 variant with per-party binding factors.
+
+### Key Generation (ChillDKG)
+
+Key generation uses **ChillDKG**, a fully standalone DKG protocol adapted from the [BIP-FROST-DKG](https://github.com/BlockstreamResearch/bip-frost-dkg) specification. ChillDKG replaces the basic Pedersen DKG used in the original FROST paper with a three-layered protocol that provides encrypted share transport, built-in agreement, recovery, and blame identification — all without requiring external secure channels or consensus mechanisms.
+
+#### Why ChillDKG instead of Pedersen DKG
+
+The original FROST paper specifies a Pedersen-style DKG where shares are sent in plaintext over assumed secure channels, participants have no way to agree on whether the DKG succeeded, faulty participants cannot be identified, and lost shares are unrecoverable. ChillDKG solves all of these problems:
+
+| Property | Pedersen DKG | ChillDKG |
+|---|---|---|
+| Share transport | Plaintext (requires secure channels) | ECDH-encrypted |
+| Agreement | None (requires external consensus) | Built-in (CertEq protocol) |
+| Blame | None | Identifies faulty participants |
+| Recovery | None | From host key + recovery data |
+| Topology | Peer-to-peer | Coordinator-relay |
+
+#### Architecture
+
+ChillDKG is internally composed of three layers, each adding functionality:
+
+| Layer | Protocol | What it adds |
+|-------|----------|-------------|
+| 1 | **SimplPedPop** | Simplified Pedersen DKG with proofs of possession |
+| 2 | **EncPedPop** | Wraps SimplPedPop with ECDH encryption of shares |
+| 3 | **ChillDKG** | Wraps EncPedPop with CertEq equality check |
+
+These layers execute together as a single protocol. The full ChillDKG protocol runs in 3 rounds for participants and 2 rounds for the coordinator:
+
+```
+Setup:
+  Each participant has a long-term host keypair (hostseckey, hostpubkey).
+  All parties agree on SessionParams = (hostpubkeys[], t).
+
+Round 1 (participant → coordinator):
+  Generate VSS polynomial, proof of possession, ECDH nonce.
+  Encrypt partial secret shares to each participant using ECDH.
+
+Coordinator aggregation:
+  Aggregate commitments and encrypted shares.
+
+Round 2 (participant → coordinator):
+  Verify proofs of possession, decrypt aggregated share via ECDH,
+  verify share against VSS commitment, sign transcript with CertEq.
+
+Coordinator finalization:
+  Collect all CertEq signatures into certificate.
+
+Round 3 (participant finalization):
+  Verify certificate, output final DKG result + recovery data.
+```
+
+#### Mathematical Details
+
+Each party `P_i`:
+
+1. Generates a deterministic VSS polynomial `f_i(x)` of degree `t` from a seed derived via tagged hashing.
+2. Computes commitments `C_{i,j} = [a_{i,j}] • G` for `j = 0, ..., t`.
+3. Produces a Schnorr proof of possession (signature on its index with the VSS secret key).
+4. Encrypts partial shares `f_i(j)` to each party `P_j` using Hashed ElGamal multi-recipient KEM over ECDH.
+
+The coordinator aggregates commitments and encrypted shares (homomorphic sum of ciphertexts). Each participant decrypts their aggregated share and verifies it against the aggregated VSS commitment.
+
+After successful verification:
+
+- Party `P_i`'s secret share: `s_i = Σ_j f_j(i) mod q`
+- The group secret (never reconstructed): `s = Σ_j a_{j,0} mod q`
+- The group public key: `A = [s] • G = Σ_j C_{j,0}`
+- Party `P_i`'s public share: `A_i = [s_i] • G`
+
+The CertEq protocol ensures all honest participants agree on the DKG output by having each participant sign a transcript hash with their host key, and verifying all signatures before accepting.
+
+**Implementation**: [`pkg/frost/chilldkg/`](pkg/frost/chilldkg/)
+
+### Signing Protocol
+
+Signing is a 2-round protocol executed by a subset `T` of `t+1` parties. It produces a standard Schnorr signature `(R, S)` verifiable with the group key `A`.
+
+#### Round 0 — Preprocessing (PreRound)
+
+Each signer `P_i` samples fresh nonce pairs:
+
+```
+d_i ←$ Z_q,    D_i = [d_i] • G
+e_i ←$ Z_q,    E_i = [e_i] • G
+```
+
+and broadcasts `(D_i, E_i)` to all other signers.
+
+**Implementation**: [`pkg/frost/sign/round0.go`](pkg/frost/sign/round0.go)
+
+#### Round 1 — Signing (SignRound)
+
+After receiving all `(D_j, E_j)` from other signers in `T`, each signer computes:
+
+1. **Binding factors** (per-party, to prevent forgery attacks):
+   ```
+   B = (ID_1 ∥ D_1 ∥ E_1) ∥ ... ∥ (ID_n ∥ D_n ∥ E_n)
+   ρ_j = SHA-512("FROST-SHA512" ∥ j ∥ SHA-512(M) ∥ B)    for each j ∈ T
+   ```
+
+2. **Per-party nonce commitments**:
+   ```
+   R_j = D_j + [ρ_j] • E_j    for each j ∈ T
+   ```
+
+3. **Aggregate nonce**:
+   ```
+   R = Σ_{j ∈ T} R_j
+   ```
+
+4. **Challenge** (standard Schnorr):
+   ```
+   c = SHA-512(R.BytesEd25519() ∥ A.BytesEd25519() ∥ M) mod q
+   ```
+
+5. **Signature share**:
+   ```
+   σ_i = d_i + ρ_i • e_i + c • Λ_{T,i} • s_i   mod q
+   ```
+
+Each signer broadcasts `σ_i`.
+
+**Implementation**: [`pkg/frost/sign/round1.go`](pkg/frost/sign/round1.go)
+
+#### Round 2 — Aggregation and Verification
+
+Each party verifies every other signer's share using the public information:
+
+```
+[σ_j] • G  ==  R_j + [c • Λ_{T,j}] • A_j
+```
+
+which is equivalent to checking (using the efficient double-scalar multiplication):
+
+```
+[c] • (-[Λ_j] • A_j) + [σ_j] • G  ==  R_j
+```
+
+If all shares verify, the final signature is:
+
+```
+S = Σ_{j ∈ T} σ_j   mod q
+σ = (R, S)
+```
+
+**Correctness proof**: The signature `(R, S)` is a valid Schnorr signature because:
+
+```
+[S] • G = Σ_j [σ_j] • G
+        = Σ_j (R_j + [c • Λ_j] • A_j)
+        = R + [c] • Σ_j [Λ_j] • A_j
+        = R + [c] • A
+```
+
+which is exactly the Schnorr verification equation `[S] • G = R + [c] • A`.
+
+**Implementation**: [`pkg/frost/sign/round2.go`](pkg/frost/sign/round2.go)
+
+### Share Validation (Identifiable Aborts)
+
+If a signer `P_j` submits an invalid signature share `σ_j`, the other parties can identify the cheater by checking:
+
+```
+[σ_j] • G  ≠  R_j + [c • Λ_{T,j}] • A_j
+```
+
+This property (IA-CMA) is critical for the ROAST wrapper, which uses it to exclude malicious signers and retry with honest ones.
+
+### Security Properties
+
+| Property | Guarantee |
+|---|---|
+| **Unforgeability** | No coalition of up to `t` malicious signers can forge a signature (under OMDL in ROM) |
+| **Identifiable aborts** | If a session fails, at least one malicious signer is identified |
+| **Concurrent security** | Multiple signing sessions can run safely in parallel |
+| **Compatibility** | Output signatures are standard Ed25519 Schnorr signatures |
+
+### ROAST — Robust Asynchronous Wrapper
+
+ROAST is a wrapper protocol that turns FROST into a robust and asynchronous signing protocol. It is implemented in [`pkg/roast/`](pkg/roast/).
+
+A semi-trusted coordinator maintains a set `R` of responsive signers. Whenever `|R| ≥ t+1`, the coordinator initiates a new FROST signing session with those signers. Each signer responds with a signature share `σ_i` for the current session and a fresh presignature share `(D'_i, E'_i)` for the next session (pipelining).
+
+If a signer provides an invalid share, it is marked malicious via `ShareVal` and excluded. If a signer is non-responsive, its session may fail, but the coordinator initiates a new session with the remaining responsive signers.
+
+**Key invariant**: Each signer is pending in at most one session at a time. With `f ≤ n - t - 1` malicious signers, at most `f + 1` sessions are needed, and the protocol terminates after at most `n - t + 1` sessions (Theorem 4.3 from the ROAST paper).
+
+**Usage via CLI**:
+```bash
+go run ./cmd/keygen/ 2 5          # generate keys: t=2, n=5
+go run ./cmd/roast/ keygenout.json "message"      # sign with ROAST
+go run ./cmd/roast/ keygenout.json "message" 2    # sign with 2 simulated malicious signers
+```
+
+### Protocol Variant
 
 The FROST paper proposes two variants of the protocol. 
 We implement the "single-round" version of FROST, rather than the 4-round variant FROST-Interactive.
@@ -129,9 +327,9 @@ This variant is the one that is proposed for practical implementations, however 
 
 ## Instructions
 
-This FROST-Ed25519 implementation includes a round-based architecture for both the key generation and signing protocols.
-The cryptographic protocols are defined in [pkg/frost/keygen]() and [pkg/frost/sign]().
-They are handled by a [`State`](pkg/state/state.go) object that takes care of storing messages, passing them to the round at the right time, and reporting any error that may have occurred.
+This FROST-Ed25519 implementation includes a round-based architecture for key generation and signing.
+Key generation uses ChillDKG ([`pkg/frost/chilldkg/`](pkg/frost/chilldkg/)), and signing uses FROST ([`pkg/frost/sign/`](pkg/frost/sign/)).
+The signing protocol is handled by a [`State`](pkg/state/state.go) object that takes care of storing messages, passing them to the round at the right time, and reporting any error that may have occurred.
 
 Users of this library should only interact with [`State`](pkg/state/state.go) types. 
 
@@ -143,36 +341,52 @@ A set of `party.ID`s is stored as a [`party.IDSlice`](pkg/frost/party/set.go) wh
 Optionally, a `timeout` argument can be provided, to force the protocol to abort if the time duration between two received messages is longer than `timeout`.
 If it is set to 0, then there is no limit.
 
-Appropriate [`State`](pkg/state/state.go)s can be created by calling the functions [`frost.NewKeygenState`](pkg/frost/frost.go) or [`frost.NewSignState`](pkg/frost/frost.go).
-They both return the following:
+For signing, a [`State`](pkg/state/state.go) can be created by calling [`frost.NewSignState`](pkg/frost/frost.go), which returns:
 - A [`State`](pkg/state/state.go) object used to interact with the protocol
 - An `Output` object whose attributes are initialized to `nil`, and populated asynchronously when protocol has successfully completed.
 - An `error` indicating whether the state was successfully created.
 
-An example of how to use the  [`State`](pkg/state/state.go) struct can be found in [example/main.go]().
+An example of how to use the library can be found in [example/main.go]().
 
 ### Keygen
 
-The key generation protocol we implement is as described in the original paper.
+Key generation uses ChillDKG, a coordinator-relay protocol. Each participant needs a long-term host keypair and agreed-upon session parameters.
 
-Calling [`frost.NewKeygenState`](pkg/frost/frost.go) with the following arguments creates a [`State`](pkg/state/state.go) object that can execute the protocol. 
 ```go
-var (
-    partyID     party.ID        // ID of the party initiating the key generation (`ID` type is an alias for `uint16`)
-    partyIDs    party.IDSlice   // sorted slice of all party IDs 
-    threshold   party.Size      // maximum number of corrupted parties allowed (`threshold`+1 parties required for signing)
-    timeout     time.Duration   // maximum time allowed between two messages received. A duration of 0 indicates no timeout
+import (
+    "github.com/taurusgroup/frost-ed25519/pkg/frost/chilldkg"
+    "github.com/taurusgroup/frost-ed25519/pkg/frost/party"
+    "github.com/taurusgroup/frost-ed25519/pkg/ristretto"
 )
 
-state, output, err := frost.NewKeygenState(partyID, partyIDs, threshold, timeout)
+hostseckeys := make([]*ristretto.Scalar, n)
+hostpubkeys := make([]ristretto.Element, n)
+for i := 0; i < n; i++ {
+    sk, pk, _ := chilldkg.GenerateHostKey()
+    hostseckeys[i] = sk
+    hostpubkeys[i] = *pk
+}
+
+params := &chilldkg.SessionParams{
+    HostPubkeys: hostpubkeys,
+    Threshold:   party.Size(t),
+}
+
+outputs, recoveryData, err := chilldkg.SimulateSession(hostseckeys, params)
 ```
 
-Once the protocol has finished, the [`output`](pkg/frost/keygen/output.go) contains the following two fields:
+`SimulateSession` runs the full 3-round ChillDKG protocol in-memory. For networked deployments, use `ParticipantStep1`, `CoordinatorStep1`, `ParticipantStep2`, `CoordinatorFinalize`, and `ParticipantFinalize` individually.
 
-- [`Public`](pkg/eddsa/public.go)
-  contains the public key shares of all parties that participated in the protocol,
-  as well as the group key these define.
-- [`SecretKey`](pkg/eddsa/secret_share.go) is the party's share of the group's signing key.
+To convert ChillDKG output to FROST signing types:
+
+```go
+public, secretShares, err := chilldkg.OutputToFROST(outputs, params)
+```
+
+The output contains:
+- [`Public`](pkg/eddsa/public.go): public key shares of all parties and the group key.
+- [`SecretShare`](pkg/eddsa/secret_share.go): each party's share of the group signing key.
+- `RecoveryData`: allows restoring DKG output from a host key if shares are lost.
 
 ### Sign
 
@@ -246,7 +460,7 @@ Full test coverage is however not guaranteed.
 
 ### Example usage
 
-A simple example of how to use this library can be found in [test/sign_test.go](test/sign_test.go) and [test/keygen_test.go](test/keygen_test.go).
+A simple example of how to use this library can be found in [test/sign_test.go](test/sign_test.go), [test/keygen_test.go](test/keygen_test.go), and [example/main.go](example/main.go).
 
 ## Security
 
