@@ -11,19 +11,25 @@ import (
 
 	"github.com/taurusgroup/frost-ed25519/pkg/eddsa"
 	"github.com/taurusgroup/frost-ed25519/pkg/frost/party"
+	"github.com/taurusgroup/frost-ed25519/pkg/ristretto"
 	"github.com/taurusgroup/frost-ed25519/pkg/roast"
 )
 
 func usage() {
 	cmd := filepath.Base(os.Args[0])
-	fmt.Printf("usage: %v <JSON file> <message> [malicious_count]\n", cmd)
+	fmt.Printf("usage: %v <JSON file> <message> [malicious_count] [--reputation]\n", cmd)
 	fmt.Println("  JSON file:        keygen output from cmd/keygen")
 	fmt.Println("  message:          message to sign")
 	fmt.Println("  malicious_count:  optional number of simulated non-responsive signers (default: 0)")
+	fmt.Println("  --reputation:     use reputation-based coordinator")
+}
+
+type coordinatorHandle interface {
+	HandleResponse(from party.ID, sigShare *ristretto.Scalar, preShare *roast.PreSignatureShare) (*eddsa.Signature, []*roast.SignRequest, error)
 }
 
 func main() {
-	if len(os.Args) < 3 || len(os.Args) > 4 {
+	if len(os.Args) < 3 || len(os.Args) > 5 {
 		usage()
 		return
 	}
@@ -32,13 +38,18 @@ func main() {
 	message := []byte(os.Args[2])
 
 	maliciousCount := 0
-	if len(os.Args) == 4 {
-		var err error
-		maliciousCount, err = strconv.Atoi(os.Args[3])
-		if err != nil {
-			fmt.Printf("invalid malicious_count: %v\n", err)
-			usage()
-			return
+	useReputation := false
+	for _, arg := range os.Args[3:] {
+		if arg == "--reputation" {
+			useReputation = true
+		} else {
+			var err error
+			maliciousCount, err = strconv.Atoi(arg)
+			if err != nil {
+				fmt.Printf("invalid argument: %v\n", arg)
+				usage()
+				return
+			}
 		}
 	}
 
@@ -80,7 +91,20 @@ func main() {
 		maliciousSet[partyIDs[i]] = true
 	}
 
-	coord := roast.NewCoordinator(publicShares, t, message)
+	var coord coordinatorHandle
+	if useReputation {
+		config := roast.DefaultReputationConfig()
+		rc, err := roast.NewReputationCoordinator(publicShares, t, message, config)
+		if err != nil {
+			fmt.Printf("error: %v\n", err)
+			return
+		}
+		coord = rc
+		fmt.Printf("  using reputation coordinator (w0=%.1f, wmax=%.1f, δ+=%.1f, γ=%.1f)\n",
+			config.W0, config.WMax, config.DeltaPos, config.Gamma)
+	} else {
+		coord = roast.NewCoordinator(publicShares, t, message)
+	}
 
 	signers := make(map[party.ID]*roast.Signer, n)
 	for _, id := range partyIDs {
